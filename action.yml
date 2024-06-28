@@ -1,6 +1,6 @@
 name: Terraform Apply a Pull Request
 description: This workflow will run terraform apply on the merge commit of a pull request and upload the output to S3 for persistence.
-author: jrafferty@tamu.edu
+author: jrafferty@tamu.edu, andrewjdean64@tamu.edu
 
 inputs:
   debug:
@@ -19,7 +19,7 @@ inputs:
     required: false
     default: latest
   terraform-workspace:
-    description: Terraform workspace to select. Must already exist 
+    description: Terraform workspace to select. Must already exist
     required: false
     default: default
   terraform-init-flags:
@@ -85,25 +85,26 @@ runs:
       with:
         terraform_version: ${{ inputs.terraform-version }}
 
+    - name: Terraform Init
+      id: init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: terraform init ${{ inputs.terraform-init-flags }}
+
     - name: Terraform Apply
       id: apply
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         TF_WORKSPACE: ${{ inputs.terraform-workspace }}
-      run: |
-        terraform init ${{ inputs.terraform-init-flags }}
-        terraform apply -input=false -no-color ${{ inputs.auto-approve == 'true' && '-auto-approve' || '' }} ${{ inputs.terraform-apply-flags }}
+      run: "terraform apply -input=false -no-color ${{ inputs.auto-approve == 'true' && '-auto-approve' || '' }} ${{ inputs.terraform-apply-flags }} |& tee apply.log"
       continue-on-error: true
 
-    - name: Write Apply output to file
+    - name: Prepare Apply output for comment
       id: output
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
-        touch apply.log
-        echo "${{ steps.apply.outputs.stdout }}" >> apply.log
-        echo "${{ steps.apply.outputs.stderr }}" >> apply.log
         echo "filename=apply.log" >> $GITHUB_OUTPUT
 
         EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
@@ -112,6 +113,12 @@ runs:
         echo "$EOF" >> "$GITHUB_OUTPUT"
 
         echo "summary=$(cat apply.log | grep 'Apply complete')" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "body<<EOF"
+          cat apply.log | grep -v 'Refreshing state...\|Reading...\|Read complete after\|::debug::\|\[command\]/home/runner/work/'
+          echo EOF
+        } >> "$GITHUB_OUTPUT"
 
     - name: Generate s3 key name
       id: s3
@@ -162,11 +169,11 @@ runs:
           <details open><summary>Show Output</summary>
 
           ```
-          ${{ steps.apply.outputs.stdout }}
-          ${{ steps.apply.outputs.stderr }}
+          ${{ steps.output.outputs.body }}
+
+          ```
 
           </details>
-          ```
 
     - name: Create issue on apply failure
       uses: actions/github-script@v6
@@ -182,8 +189,8 @@ runs:
             <details open><summary>Show Output</summary>
 
             \`\`\`
-            ${{ steps.apply.outputs.stdout }}
-            ${{ steps.apply.outputs.stderr }}
+            ${{ steps.output.outputs.body }}
+
             \`\`\`
 
             </details>
