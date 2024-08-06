@@ -30,18 +30,42 @@ inputs:
     description: CLI flags to use with terraform apply
     required: false
     default: ""
-  s3-bucket:
-    description: Override s3 bucket to upload output to. Defaults to the same as the state backend.
+  persist-apply-log:
+    description: Persist the terraform apply log in long-term storage, by default in the same location as your backend state.
+    required: false
+    default: "true"
+  bucket:
+    description: Override the bucket name for s3 and gcs to upload output to. Defaults to the same as the state backend, if using s3 or gcp
     required: false
     default: ""
-  s3-key:
-    description: Override s3 object key to upload output to. Defaults to a subdirectory of the statefile key.
+  resource-group-name:
+    description: Override the azurerm resource group to upload output to.
+    required: false
+    default: ""
+  storage-account-name:
+    description: Override the storage account to use to upload output. Defaults to the same as the azurerm backend, if using azurerm.
+    required: false
+    default: ""
+  container-name:
+    description: Override the container into which to upload the output. Defaults to the same as the azurerm backend, if using azurerm.
+    required: false
+    default: ""
+  key-path:
+    description: Override the path to upload output to. Defaults to the root.
+    required: false
+    default: ""
+  key-name:
+    description: Override the filename portion of the key. Defaults to a path merge of the github repo, PR ID, and a timestamp
     required: false
     default: ""
   pr-id:
     description: Associate the run with a specific pull request id. Defaults to finding the ID from the merge commit.
     required: false
     default: ""
+  no-pr:
+    description: Don't require or look up a pull request ID. Skip associated actions
+    required: false
+    default: "false"
   auto-approve:
     description: Auto approve terraform apply
     required: false
@@ -51,21 +75,19 @@ outputs:
   apply_output:
     description: The terraform apply output
     value: ${{ steps.output.outputs.output }}
-  s3_path:
-    description: The S3 URL of the uploaded log file
-    value: ${{ steps.s3.outputs.s3_url }}
 
 runs:
   using: composite
   steps:
     - name: Find if this push belonged to a PR
-      if: github.event_name == 'push'
+      if: (github.event_name == 'push') && (inputs.no-pr != 'true')
       uses: 8BitJonny/gh-get-current-pr@2.2.0
       id: pr
 
     - name: Consolidate PR ID
       shell: bash
       id: pr_id
+      if: inputs.no-pr != 'true'
       run: |
         if [[ "${{ github.event_name }}" == "push" ]]; then
           if [[ "${{ steps.pr.outputs.pr_found }}" == "false" ]]; then
@@ -81,7 +103,7 @@ runs:
         echo "This workflow run is associated with pull request ID: $number"
 
     - name: setup Terraform
-      uses: hashicorp/setup-terraform@v2
+      uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: ${{ inputs.terraform-version }}
 
@@ -104,7 +126,7 @@ runs:
         touch apply.log
         echo "${{ steps.apply.outputs.stdout }}" >> apply.log
         echo "${{ steps.apply.outputs.stderr }}" >> apply.log
-        echo "filename=apply.log" >> $GITHUB_OUTPUT
+        echo "filepath=$(pwd)/apply.log" >> $GITHUB_OUTPUT
 
         EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
         echo "output<<$EOF" >> "$GITHUB_OUTPUT"
@@ -113,51 +135,48 @@ runs:
 
         echo "summary=$(cat apply.log | grep 'Apply complete')" >> "$GITHUB_OUTPUT"
 
-    - name: Generate s3 key name
-      id: s3
+    - name: Copy logs to persistent storage
+      id: copy_logs
+      if: inputs.persist-apply-log == 'true'
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
       run: |
-        # Download hcl2json
-        curl -Lo hcl2json $(curl -s https://api.github.com/repos/tmccombs/hcl2json/releases | jq -r '.[] | select(.tag_name == "v0.5.0").assets[] | select(.name == "hcl2json_linux_amd64").browser_download_url')
-        chmod +x hcl2json
 
-        # Get s3 bucket and key by converting terraform backend config to json
-        json=$(./hcl2json *.tf)
+        # Set value for the file to copy
+        source_file="${{ steps.output.outputs.filepath }}"
 
-        [[ -z "${{ inputs.s3-bucket }}" ]] \
-          && s3_bucket=$(echo $json | jq -r '.terraform[0].backend.s3[0].bucket') \
-          || s3_bucket=${{ inputs.s3-bucket }}
+        # Set value for the key prefix
+        [[ -n "${{ inputs.key-prefix }}" ]] && key_prefix="${{ inputs.key-prefix }}" || key_prefix="apply_logs"
 
-        [[ -z "${{ inputs.s3-key }}" ]] \
-          && s3_key=$(echo $json | jq -r '.terraform[0].backend.s3[0].key') \
-          || s3_key=${{ inputs.s3-key }}
+        # Set value for the key name
+        [[ -n "${{ inputs.key-name }}" ]] && key_name="${{ inputs.key-name }}" || key_name="${{ github.repository }}/pr-${{ steps.pr_id.outputs.number }}/$(date -u +'%Y-%m-%d/apply-%Y-%m-%dT%H:%M:%SZ.log')"
 
-        echo "S3 bucket: $s3_bucket"
-        echo "S3 key: $s3_key"
+        # Where to find the terraform
+        working_directory="${{ inputs.working-directory }}"
 
-        # Generate s3 key name
-        key="apply_logs/${{ github.repository }}/pr-${{ steps.pr_id.outputs.number }}/$(date -u +'%Y-%m-%d/apply-%Y-%m-%dT%H:%M:%SZ.log')"
-        echo "S3 key name: $key"
+        # Load copy logs script
+        source "${{github.action_path}}/copy_logs.sh"
 
-        # Copy terraform apply log to s3
-        s3_url="s3://${s3_bucket}/${s3_key}/${key}"
-        aws s3 cp ${{ steps.output.outputs.filename }} $s3_url
+        copy_logs
+        status=$?
 
-        echo "s3_bucket=$s3_bucket" >> $GITHUB_OUTPUT
-        echo "s3_key=$s3_key/$key" >> $GITHUB_OUTPUT
-        echo "s3_url=$s3_url" >> $GITHUB_OUTPUT
+        if [ $status == 0 ]; then
+          echo ${{ steps.copy_logs.outputs.output }}
+        else
+          echo "Wasn't apply to persist apply logs"
+          return $status
+        fi
 
     - name: Comment Apply output to PR
       id: comment-apply
       uses: peter-evans/create-or-update-comment@v2
+      if: inputs.no-pr != 'true'
       with:
         token: ${{ inputs.GITHUB_TOKEN }}
         issue-number: ${{ steps.pr_id.outputs.number }}
         body: |
           Terraform Apply: ${{ steps.output.outputs.summary }}
 
-          Full log persisted at: [${{ steps.s3.outputs.s3_url}}](https://s3.console.aws.amazon.com/s3/object/${{ steps.s3.outputs.s3_bucket }}?prefix=${{ steps.s3.outputs.s3_key}})
+          ${{ steps.copy_logs.outputs.output}}
 
           <details open><summary>Show Output</summary>
 
@@ -177,7 +196,7 @@ runs:
 
             Please review the logs and take appropriate action.
 
-            Full log persisted at: [${{ steps.s3.outputs.s3_url}}](https://s3.console.aws.amazon.com/s3/object/${{ steps.s3.outputs.s3_bucket }}?prefix=${{ steps.s3.outputs.s3_key}})
+            ${{ steps.copy_logs.outputs.output}}
 
             <details open><summary>Show Output</summary>
 
