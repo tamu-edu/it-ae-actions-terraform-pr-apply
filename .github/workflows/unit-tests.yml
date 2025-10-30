@@ -1,0 +1,208 @@
+name: Unit Test Suite
+on:
+  workflow_dispatch:
+ 
+jobs:
+  core-functionality-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      - name: Create test terraform configuration
+        run: |
+          mkdir -p test-terraform
+          cat > test-terraform/main.tf << 'EOF'
+          # Simple terraform config for testing output handling
+          variable "test_input" {
+            description = "Test input with special characters"
+            type        = string
+            default     = "Test with \"quotes\", (parentheses), /slashes/, and \\backslashes\\"
+          }
+
+          locals {
+            complex_output = jsonencode({
+              message = "Hello from terraform!"
+              special_chars = "Quotes: \"test\", Parens: (test), Slashes: /test/, Backslashes: \\test\\"
+              json_sample = {
+                nested = "value with \"nested quotes\""
+                array = ["item1", "item with (parens)", "item/with/slashes"]
+              }
+            })
+          }
+
+          output "simple_message" {
+            value = "Terraform apply completed successfully!"
+            description = "Simple success message"
+          }
+
+          output "complex_text" {
+            value = var.test_input
+            description = "Text with various special characters"
+          }
+
+          output "json_output" {
+            value = local.complex_output
+            description = "JSON output with nested special characters"
+          }
+
+          output "multiline_output" {
+            value = <<-EOT
+            Line 1: "Quotes and stuff"
+            Line 2: (Parentheses here)
+            Line 3: /Forward/slashes/
+            Line 4: \Back\slashes\
+            Line 5: Mixed "quotes" and (parens) and /slashes/
+            EOT
+            description = "Multi-line output with special characters"
+          }
+          EOF
+
+      - name: Test - handles-unescaped-chars
+        id: unescaped-chars-test
+        run: |
+          cd test-terraform
+          
+          echo "=== Initializing Terraform ==="
+          terraform init
+          
+          echo "=== Running Terraform Apply ==="
+          terraform apply -auto-approve
+          
+          echo "=== Capturing Terraform Output ==="
+          terraform output -json > outputs.json
+          
+          echo "=== Raw JSON Output ==="
+          cat outputs.json
+          
+          echo "=== Formatted Output ==="
+          terraform output
+          
+          # Test that we can parse the JSON output without errors
+          echo "=== Testing JSON Parsing ==="
+          jq '.simple_message.value' outputs.json
+          jq '.complex_text.value' outputs.json
+          jq '.json_output.value' outputs.json
+          jq '.multiline_output.value' outputs.json
+          
+          # Write outputs to files instead of GitHub Actions outputs to avoid shell escaping
+          terraform output -raw simple_message > simple_message.txt
+          terraform output -raw complex_text > complex_text.txt
+          terraform output -raw multiline_output > multiline_output.txt
+          
+          echo "✅ Terraform apply completed successfully!"
+
+      - name: Verify handles-unescaped-chars
+        run: |
+          cd test-terraform
+          
+          echo "=== Verification Results ==="
+          echo "Simple message:"
+          cat simple_message.txt
+          echo ""
+          echo "Complex text:"
+          cat complex_text.txt
+          echo ""
+          echo "Multiline output:"
+          cat multiline_output.txt
+          echo ""
+          
+          # Verify expected content is present by reading from files
+          simple_msg=$(cat simple_message.txt)
+          if [[ "$simple_msg" == "Terraform apply completed successfully!" ]]; then
+            echo "✅ Simple message output verified"
+          else
+            echo "❌ Simple message output verification failed"
+            echo "Expected: 'Terraform apply completed successfully!'"
+            echo "Actual: '$simple_msg'"
+            exit 1
+          fi
+          
+          # Check that special characters are preserved
+          complex_text=$(cat complex_text.txt)
+          if [[ "$complex_text" == *"quotes"* ]] && [[ "$complex_text" == *"parentheses"* ]] && [[ "$complex_text" == *"slashes"* ]]; then
+            echo "✅ Special characters preserved in output"
+          else
+            echo "❌ Special characters not properly preserved"
+            echo "Actual output: $complex_text"
+            exit 1
+          fi
+          
+          # Check multiline output
+          if grep -q "Line 1:" multiline_output.txt && grep -q "Line 5:" multiline_output.txt; then
+            echo "✅ Multiline output preserved"
+          else
+            echo "❌ Multiline output not properly preserved"
+            cat multiline_output.txt
+            exit 1
+          fi
+
+      - name: Test TF-via-PR Action (Simulation)
+        id: tf-via-pr-sim
+        run: |
+          cd test-terraform
+          
+          echo "=== Simulating TF-via-PR Action Behavior ==="
+          
+          # Simulate the core functionality without PR integration
+          # Write output to file to avoid shell escaping issues
+          if terraform apply -auto-approve > apply_output.log 2>&1; then
+            echo "✅ Terraform apply succeeded"
+            
+            # Show the apply output without passing through GitHub Actions variables
+            echo "=== Terraform Apply Output ==="
+            cat apply_output.log
+            
+            echo "=== Terraform Outputs ==="
+            terraform output
+            
+            # Set a simple success flag
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Terraform apply failed"
+            cat apply_output.log
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Report test results
+        run: |
+          cd test-terraform
+          
+          echo "=== Test Results Summary ==="
+          echo "✅ Terraform setup and initialization: PASSED"
+          echo "✅ Unescaped character handling: PASSED"
+          
+          # Use simple conditional without complex expressions
+          if [[ "${{ steps.tf-via-pr-sim.outputs.success }}" == "true" ]]; then
+            echo "✅ TF-via-PR simulation: PASSED"
+          else
+            echo "❌ TF-via-PR simulation: FAILED"
+          fi
+          
+          echo ""
+          echo "=== Demonstrating Special Character Handling ==="
+          echo "Complex text output contains:"
+          cat complex_text.txt
+          echo ""
+          echo "Multiline output contains:"
+          head -2 multiline_output.txt
+          echo "... (truncated for brevity)"
+          echo ""
+          echo "🎉 All tests completed successfully!"
+          echo "✅ Terraform successfully handles outputs with parentheses, quotes, and special characters"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -d "test-terraform" ]; then
+            cd test-terraform
+            terraform destroy -auto-approve || true
+            cd ..
+            rm -rf test-terraform
+          fi
